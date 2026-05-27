@@ -169,9 +169,10 @@ function buildDiceMesh(
 ): THREE.Mesh {
   const geo = buildGeometry(radius);
 
-  const materials: THREE.MeshStandardMaterial[] = Array.from({ length: 20 }, (_, i) =>
+  const diceNumbers = [1,19,3,17,7,9,13,15,10,16,4,18,2,20,14,11,5,12,8,6];
+  const materials: THREE.MeshStandardMaterial[] =diceNumbers.map((i) =>
     new THREE.MeshStandardMaterial({
-      map: makeNumberTexture(i + 1, numberColor, faceColor),
+      map: makeNumberTexture(i, numberColor, faceColor),
       transparent: faceOpacity < 1,
       opacity: faceOpacity,
       metalness,
