@@ -1,8 +1,8 @@
 import "./globals.css";
-import Navbar from "@/components/Navbar"
+import Navbar from "@/components/Navabr";
 
 export const metadata = {
-  title: "DnD Nexus",
+  title: "Portal Quest Games",
   description: "Modern D&D Toolkit",
 };
 export default function RootLayout({
@@ -12,12 +12,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className="bg-[#17051F] text-white">
-
-        <Navbar />
-
-        {children}
-
+      <body  dir="rtl">
+        <section className="w-full mx-auto flex flex-col lg:flex-row min-h-screen p-12.5 gap-30 bg-linear-to-r from-[#1a0c26] to-[#241033]">
+          <Navbar />
+          {children}
+        </section>  
       </body>
     </html>
   );

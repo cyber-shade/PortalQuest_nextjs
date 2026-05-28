@@ -3,8 +3,6 @@
 import { useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
 export interface D20DiceProps {
   size?: number;
   numberColor?: string;
@@ -15,15 +13,13 @@ export interface D20DiceProps {
   backgroundColor?: string;
   backgroundTexture?: string;
   faceOpacity?: number;
-  /** Metalness of the die material (0–1). Default: 0.3 */
   metalness?: number;
-  /** Roughness of the die material (0–1). Default: 0.4 */
   roughness?: number;
+  /** Seconds after settling before idle spin resumes. Default: 4 */
+  idleDelay?: number;
   onRollComplete?: (result: number) => void;
   className?: string;
 }
-
-// ─── Internal state ───────────────────────────────────────────────────────────
 
 interface DiceState {
   renderer: THREE.WebGLRenderer;
@@ -31,74 +27,54 @@ interface DiceState {
   camera: THREE.PerspectiveCamera;
   mesh: THREE.Mesh;
   animId: number;
-  rolling: boolean;
-  settled: boolean;
+  phase: "idle" | "rolling" | "snapping" | "settled";
   spinDecay: number;
   velX: number;
   velY: number;
   velZ: number;
-  snapping: boolean;         // true while we're slerping to face-up orientation
   snapTarget: THREE.Quaternion | null;
+  idleTimeout: ReturnType<typeof setTimeout> | null;
   rollTimeout: ReturnType<typeof setTimeout> | null;
 }
 
-// ─── Icosahedron face normals (world space, detail=0) ────────────────────────
-// We pre-compute all 20 face normals once so we can find which is closest
-// to the camera (+Z) after rolling stops.
+// ─── Face normals ─────────────────────────────────────────────────────────────
 
-function getIcosahedronFaceNormals(): THREE.Vector3[] {
-  const geo = new THREE.IcosahedronGeometry(1, 0);
-  const nonIndexed = geo.toNonIndexed();
-  geo.dispose();
-  nonIndexed.computeVertexNormals();
-
-  const pos = nonIndexed.attributes.position;
+function computeFaceNormals(): THREE.Vector3[] {
+  const indexed = new THREE.IcosahedronGeometry(1, 0);
+  const geo = indexed.toNonIndexed();
+  indexed.dispose();
+  const pos = geo.attributes.position;
   const normals: THREE.Vector3[] = [];
-
   for (let i = 0; i < 20; i++) {
-    const base = i * 3;
-    // Average of the 3 vertex normals = face normal for a flat triangle
-    const n = new THREE.Vector3(
-      (pos.getX(base) + pos.getX(base + 1) + pos.getX(base + 2)) / 3,
-      (pos.getY(base) + pos.getY(base + 1) + pos.getY(base + 2)) / 3,
-      (pos.getZ(base) + pos.getZ(base + 1) + pos.getZ(base + 2)) / 3,
-    ).normalize();
-    normals.push(n);
+    const b = i * 3;
+    normals.push(
+      new THREE.Vector3(
+        (pos.getX(b) + pos.getX(b + 1) + pos.getX(b + 2)) / 3,
+        (pos.getY(b) + pos.getY(b + 1) + pos.getY(b + 2)) / 3,
+        (pos.getZ(b) + pos.getZ(b + 1) + pos.getZ(b + 2)) / 3,
+      ).normalize()
+    );
   }
-
-  nonIndexed.dispose();
+  geo.dispose();
   return normals;
 }
 
-const FACE_NORMALS = getIcosahedronFaceNormals();
+const FACE_NORMALS = computeFaceNormals();
 
 // ─── Texture ──────────────────────────────────────────────────────────────────
-//
-// UV layout per face: v0=(0,0) v1=(1,0) v2=(0.5,1)
-// Centroid in UV space: (0.5, 0.333)
-// Canvas is drawn with Y-axis flipped for Three.js, so centroid in px = (S*0.5, S*(1-0.333)) = (S*0.5, S*0.667)
 
-function makeNumberTexture(
-  num: number,
-  numberColor: string,
-  faceColor: string
-): THREE.CanvasTexture {
+function makeNumberTexture(num: number, numberColor: string, faceColor: string): THREE.CanvasTexture {
   const S = 512;
   const canvas = document.createElement("canvas");
   canvas.width = S;
   canvas.height = S;
   const ctx = canvas.getContext("2d")!;
 
-  // Flat background — no gradients that fake lighting
   ctx.fillStyle = faceColor;
   ctx.fillRect(0, 0, S, S);
 
-  // Triangle centroid in canvas pixel space
-  // UV centroid is (0.5, 0.333). Three.js flips Y for canvas textures,
-  // so pixel Y = S * (1 - 0.333) = S * 0.667
   const cx = S * 0.5;
-  const cy = S * 0.62;  // slightly above geometric centroid for optical centering
-
+  const cy = S * 0.62;
   const fontSize = Math.round(S * 0.35);
 
   ctx.save();
@@ -113,17 +89,15 @@ function makeNumberTexture(
   ctx.fillText(num.toString(), cx, cy);
   ctx.restore();
 
-  // Underline for 6/9
   if (num === 6 || num === 9) {
     ctx.font = `bold ${fontSize}px Georgia, 'Times New Roman', serif`;
-    const metrics = ctx.measureText(num.toString());
-    const halfW = metrics.width / 2;
-    const underY = cy + fontSize * 0.6;
+    const hw = ctx.measureText(num.toString()).width / 2;
+    const uy = cy + fontSize * 0.6;
     ctx.strokeStyle = numberColor;
     ctx.lineWidth = Math.max(2, fontSize * 0.07);
     ctx.beginPath();
-    ctx.moveTo(cx - halfW, underY);
-    ctx.lineTo(cx + halfW, underY);
+    ctx.moveTo(cx - hw, uy);
+    ctx.lineTo(cx + hw, uy);
     ctx.stroke();
   }
 
@@ -139,114 +113,80 @@ function buildGeometry(radius: number): THREE.BufferGeometry {
   const geo = indexed.toNonIndexed();
   indexed.dispose();
   geo.computeVertexNormals();
-
-  for (let i = 0; i < 20; i++) {
-    geo.addGroup(i * 3, 3, i);
-  }
-
-  // UVs matching the layout the texture is drawn for
-  const uvArray = new Float32Array(60 * 2);
+  for (let i = 0; i < 20; i++) geo.addGroup(i * 3, 3, i);
+  const uv = new Float32Array(60 * 2);
   for (let i = 0; i < 20; i++) {
     const b = i * 6;
-    uvArray[b + 0] = 0.0; uvArray[b + 1] = 0.0;
-    uvArray[b + 2] = 1.0; uvArray[b + 3] = 0.0;
-    uvArray[b + 4] = 0.5; uvArray[b + 5] = 1.0;
+    uv[b]     = 0.0; uv[b + 1] = 0.0;
+    uv[b + 2] = 1.0; uv[b + 3] = 0.0;
+    uv[b + 4] = 0.5; uv[b + 5] = 1.0;
   }
-  geo.setAttribute("uv", new THREE.BufferAttribute(uvArray, 2));
-
+  geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
   return geo;
 }
 
-// ─── Mesh ─────────────────────────────────────────────────────────────────────
-
-function buildDiceMesh(
-  radius: number,
-  numberColor: string,
-  faceColor: string,
-  faceOpacity: number,
-  metalness: number,
-  roughness: number,
-): THREE.Mesh {
-  const geo = buildGeometry(radius);
-
-  const diceNumbers = [1,19,3,17,7,9,13,15,10,16,4,18,2,20,14,11,5,12,8,6];
-  const materials: THREE.MeshStandardMaterial[] =diceNumbers.map((i) =>
-    new THREE.MeshStandardMaterial({
-      map: makeNumberTexture(i, numberColor, faceColor),
-      transparent: faceOpacity < 1,
-      opacity: faceOpacity,
-      metalness,
-      roughness,
-      side: THREE.FrontSide,
-    })
-  );
-  return new THREE.Mesh(geo, materials);
-}
-
-// ─── Snap-to-face helper ──────────────────────────────────────────────────────
-//
-// After the roll decays, find which face normal (transformed by current mesh
-// rotation) points most toward the camera (+Z axis). Then compute the quaternion
-// that rotates that normal to align with +Z and slerp to it.
+// ─── Snap quaternion (face → camera) ─────────────────────────────────────────
 
 function computeSnapQuaternion(mesh: THREE.Mesh): THREE.Quaternion {
   const camDir = new THREE.Vector3(0, 0, 1);
+
   let bestDot = -Infinity;
   let bestNormal = FACE_NORMALS[0].clone();
-
-  for (const faceNormal of FACE_NORMALS) {
-    // Transform face normal by current mesh world rotation
-    const worldNormal = faceNormal.clone().applyQuaternion(mesh.quaternion);
-    const dot = worldNormal.dot(camDir);
-    if (dot > bestDot) {
-      bestDot = dot;
-      bestNormal = worldNormal.clone();
-    }
+  for (const fn of FACE_NORMALS) {
+    const wn  = fn.clone().applyQuaternion(mesh.quaternion);
+    const dot = wn.dot(camDir);
+    if (dot > bestDot) { bestDot = dot; bestNormal = wn.clone(); }
   }
 
-  // Quaternion that rotates bestNormal → +Z
-  return new THREE.Quaternion().setFromUnitVectors(bestNormal, camDir);
+  const Q1 = new THREE.Quaternion().setFromUnitVectors(bestNormal, camDir);
+  return Q1.multiply(mesh.quaternion);
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function D20Dice({
-  size = 300,
-  numberColor = "#ffffff",
-  edgeColor = "#8b5cf6",
-  edgeWidth = 1.5,
-  faceColor = "#1e1b4b",
+  size            = 300,
+  numberColor     = "#ffffff",
+  edgeColor       = "#8b5cf6",
+  edgeWidth       = 1.5,
+  faceColor       = "#1e1b4b",
   faceTexture,
   backgroundColor = "transparent",
   backgroundTexture,
-  faceOpacity = 1,
-  metalness = 0.3,
-  roughness = 0.4,
+  faceOpacity     = 1,
+  metalness       = 0.3,
+  roughness       = 0.4,
+  idleDelay       = 4,
   onRollComplete,
   className,
 }: D20DiceProps) {
-  const mountRef = useRef<HTMLDivElement>(null);
-  const stateRef = useRef<DiceState | null>(null);
+  const mountRef          = useRef<HTMLDivElement>(null);
+  const stateRef          = useRef<DiceState | null>(null);
   const onRollCompleteRef = useRef(onRollComplete);
   useEffect(() => { onRollCompleteRef.current = onRollComplete; }, [onRollComplete]);
 
   useEffect(() => {
     if (!mountRef.current) return;
     const el = mountRef.current;
-    const radius = 1.4;
+
+    // ── Camera + radius tuned so die fills ~85% of canvas ──────────────────
+    // FOV 22° at distance 5 → visible half-height = 5 * tan(11°) ≈ 0.975
+    // radius 0.9 fills ~92% of that → perfect snug fit with room for edges
+    const FOV    = 22;
+    const DIST   = 5;
+    const RADIUS = 0.9;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: backgroundColor === "transparent" });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(size, size);
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
     el.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
     if (backgroundColor !== "transparent") scene.background = new THREE.Color(backgroundColor);
     if (backgroundTexture) new THREE.TextureLoader().load(backgroundTexture, (t) => { scene.background = t; });
 
-    // Lights for MeshStandardMaterial PBR shading
     scene.add(new THREE.AmbientLight(0xffffff, 0.6));
     const dir = new THREE.DirectionalLight(0xffffff, 1.4);
     dir.position.set(5, 8, 5);
@@ -256,56 +196,68 @@ export default function D20Dice({
     rim.position.set(-4, -3, 2);
     scene.add(rim);
 
-    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
-    camera.position.set(0, 0, 5);
+    const camera = new THREE.PerspectiveCamera(FOV, 1, 0.1, 100);
+    camera.position.set(0, 0, DIST);
 
-    const mesh = buildDiceMesh(radius, numberColor, faceColor, faceOpacity, metalness, roughness);
+    const diceNumbers = [1,19,3,17,7,9,13,15,10,16,4,18,2,20,14,11,5,12,8,6];
+    const geo = buildGeometry(RADIUS);
+    const materials = diceNumbers.map((n) =>
+      new THREE.MeshStandardMaterial({
+        map: makeNumberTexture(n, numberColor, faceColor),
+        transparent: faceOpacity < 1,
+        opacity: faceOpacity,
+        metalness,
+        roughness,
+        side: THREE.FrontSide,
+      })
+    );
+    const mesh = new THREE.Mesh(geo, materials);
     scene.add(mesh);
 
     if (edgeWidth > 0) {
-      const edgeGeo = new THREE.EdgesGeometry(mesh.geometry);
-      const edgeMat = new THREE.LineBasicMaterial({
-        color: new THREE.Color(edgeColor),
-        transparent: true,
-        opacity: 0.9,
-      });
-      mesh.add(new THREE.LineSegments(edgeGeo, edgeMat));
+      const eg = new THREE.EdgesGeometry(geo);
+      const em = new THREE.LineBasicMaterial({ color: new THREE.Color(edgeColor), transparent: true, opacity: 0.9 });
+      mesh.add(new THREE.LineSegments(eg, em));
     }
 
     const state: DiceState = {
       renderer, scene, camera, mesh,
       animId: -1,
-      rolling: false,
-      settled: false,
+      phase: "idle",
       spinDecay: 1,
-      velX: 0.003,
-      velY: 0.005,
-      velZ: 0.002,
-      snapping: false,
+      velX: 0.003, velY: 0.005, velZ: 0.002,
       snapTarget: null,
+      idleTimeout: null,
       rollTimeout: null,
     };
     stateRef.current = state;
 
-    const SNAP_SPEED = 0.08; // slerp factor per frame — feels like a natural settle
+    const SNAP_SPEED = 0.08;
 
     const animate = () => {
       state.animId = requestAnimationFrame(animate);
       const s = state;
 
-      if (s.snapping && s.snapTarget) {
-        // Smoothly rotate the die so the nearest face points at camera
+      if (s.phase === "snapping" && s.snapTarget) {
         mesh.quaternion.slerp(s.snapTarget, SNAP_SPEED);
-
-        const remaining = mesh.quaternion.angleTo(s.snapTarget);
-        if (remaining < 0.005) {
-          // Snap complete — fully lock to target
+        if (mesh.quaternion.angleTo(s.snapTarget) < 0.004) {
           mesh.quaternion.copy(s.snapTarget);
-          s.snapping = false;
-          s.settled = true;
           s.snapTarget = null;
+          s.phase = "settled";
+
+          // Schedule idle resume
+          if (s.idleTimeout) clearTimeout(s.idleTimeout);
+          s.idleTimeout = setTimeout(() => {
+            if (stateRef.current?.phase === "settled") {
+              stateRef.current.velX = 0.003;
+              stateRef.current.velY = 0.005;
+              stateRef.current.velZ = 0.002;
+              stateRef.current.phase = "idle";
+            }
+          }, idleDelay * 1000);
         }
-      } else if (s.rolling) {
+
+      } else if (s.phase === "rolling") {
         mesh.rotation.x += s.velX;
         mesh.rotation.y += s.velY;
         mesh.rotation.z += s.velZ;
@@ -317,20 +269,16 @@ export default function D20Dice({
 
         const speed = Math.abs(s.velX) + Math.abs(s.velY) + Math.abs(s.velZ);
         if (speed < 0.001) {
-          // Spin has decayed — begin snap-to-face
-          s.rolling = false;
           s.velX = 0; s.velY = 0; s.velZ = 0;
-
-          // Compute snap target: nearest face to camera, combined with current rotation
-          const correction = computeSnapQuaternion(mesh);
-          s.snapTarget = correction.multiply(mesh.quaternion);
-          s.snapping = true;
+          s.snapTarget = computeSnapQuaternion(mesh);
+          s.phase = "snapping";
         }
-      } else if (!s.settled) {
-        // Idle gentle spin before first roll
+
+      } else if (s.phase === "idle") {
         mesh.rotation.x += s.velX;
         mesh.rotation.y += s.velY;
       }
+      // phase === "settled" → nothing moves
 
       renderer.render(scene, camera);
     };
@@ -339,13 +287,11 @@ export default function D20Dice({
     return () => {
       cancelAnimationFrame(state.animId);
       if (state.rollTimeout) clearTimeout(state.rollTimeout);
+      if (state.idleTimeout) clearTimeout(state.idleTimeout);
       mesh.traverse((obj) => {
         if (obj instanceof THREE.Mesh) {
           const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-          mats.forEach((m) => {
-            (m as THREE.MeshStandardMaterial).map?.dispose();
-            m.dispose();
-          });
+          mats.forEach((m) => { (m as THREE.MeshStandardMaterial).map?.dispose(); m.dispose(); });
           obj.geometry.dispose();
         }
       });
@@ -354,27 +300,27 @@ export default function D20Dice({
       stateRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [size, numberColor, faceColor, edgeColor, edgeWidth, faceTexture, faceOpacity, metalness, roughness, backgroundColor, backgroundTexture]);
+  }, [size, numberColor, faceColor, edgeColor, edgeWidth, faceTexture, faceOpacity, metalness, roughness, backgroundColor, backgroundTexture, idleDelay]);
 
   const roll = useCallback(() => {
     const s = stateRef.current;
-    if (!s || s.rolling || s.snapping) return;
+    if (!s || s.phase === "rolling" || s.phase === "snapping") return;
 
     const result = Math.ceil(Math.random() * 20);
 
-    s.settled = false;
-    s.snapping = false;
+    // Cancel any pending idle resume
+    if (s.idleTimeout) { clearTimeout(s.idleTimeout); s.idleTimeout = null; }
+
     s.snapTarget = null;
 
     const sign = () => (Math.random() > 0.5 ? 1 : -1);
-    s.velX = sign() * (0.25 + Math.random() * 0.25);
-    s.velY = sign() * (0.25 + Math.random() * 0.25);
-    s.velZ = sign() * (0.10 + Math.random() * 0.15);
+    s.velX      = sign() * (0.25 + Math.random() * 0.25);
+    s.velY      = sign() * (0.25 + Math.random() * 0.25);
+    s.velZ      = sign() * (0.10 + Math.random() * 0.15);
     s.spinDecay = 0.997;
-    s.rolling = true;
+    s.phase     = "rolling";
 
     if (s.rollTimeout) clearTimeout(s.rollTimeout);
-    // Callback fires after snap animation finishes (~3s total)
     s.rollTimeout = setTimeout(() => {
       onRollCompleteRef.current?.(result);
     }, 3200);
